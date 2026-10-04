@@ -317,6 +317,33 @@ api POST "/api/v1/windows/$FID/fault-periods" '{"fault_id":"fault-01","start_at"
 api GET "/api/v1/windows/$FID/fault-periods" | python3 -c "import sys,json;print([(f['fault_id'],f['status']) for f in json.load(sys.stdin)])"
 api GET "/api/v1/windows/$FID/fault-periods?active_only=true" | python3 -c "import sys,json;print('active:',json.load(sys.stdin))"
 
+echo "== 15c. 首尾相接故障的证据归属（单独建窗口演示）=="
+TW=$(api POST /api/v1/windows '{
+  "name": "展柜F2-相接故障",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T01:00:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 3600
+}')
+TID=$(echo "$TW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+# 00:00 一条正常读数保持整窗、01:00 终止采样（间隔 3600s 恰好合法）-> pass
+api POST "/api/v1/windows/$TID/readings" '{"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":20.0}' >/dev/null
+api POST "/api/v1/windows/$TID/readings" '{"reading_id":"z","revision":1,"measured_at":"2026-10-01T01:00:00Z","temperature":20.0}' >/dev/null
+echo "-- 15c.1 无故障首签 --"
+TC1=$(api POST "/api/v1/windows/$TID/certificates/issue" '{"note":"v1-无故障"}')
+T_OLD=$(echo "$TC1" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+echo "-- 15c.2 登记首尾相接 f1=[00:02,00:05)、f2=[00:05,00:08)（并集连续遮蔽）后重签 --"
+api POST "/api/v1/windows/$TID/fault-periods" '{"fault_id":"touch-f1","start_at":"2026-10-01T00:02:00Z","end_at":"2026-10-01T00:05:00Z","reason":"温感漂移"}' >/dev/null
+api POST "/api/v1/windows/$TID/fault-periods" '{"fault_id":"touch-f2","start_at":"2026-10-01T00:05:00Z","end_at":"2026-10-01T00:08:00Z","reason":"温感漂移"}' >/dev/null
+TC2=$(api POST "/api/v1/windows/$TID/certificates/issue" '{"note":"v2-相接两故障"}')
+T_NEW=$(echo "$TC2" | python3 -c "import sys,json;c=json.load(sys.stdin);print(c['id'])")
+echo "$TC2" | python3 -c "import sys,json;e=json.load(sys.stdin)['snapshot']['evaluation'];print('审定并集仍为连续一段:',[(u['start'][11:16],u['end'][11:16]) for u in e['fault_periods']])"
+echo "-- 15c.3 报告：接点 00:05 切段，[00:02,00:05) 仅 touch-f1、[00:05,00:08) 仅 touch-f2 --"
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$T_OLD&new_certificate_id=$T_NEW" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('fault_added:',[f['fault_id'] for f in d['fault_periods_diff']['added']]);[print(c['start'][11:16],c['end'][11:16],c['before']['status'],'->',c['after']['status'],c['after']['evidence'].get('fault_ids')) for c in d['timeline']['changes']]"
+
 echo "== 16. 已签发证书撤销（单独建窗口演示；撤销只改有效性，版本/结论/快照不动）=="
 VW=$(api POST /api/v1/windows '{
   "name": "展柜G-证书撤销",

@@ -17,8 +17,11 @@
      - boundary_gap：边界空白，boundary_side=leading/trailing/empty
        （首读之前附右侧首条读数，末读之后附左侧末条读数，整窗无读数时
        两侧均无读数）；
-     - instrument_fault：被有效故障时段并集遮蔽（附覆盖该区间的故障标识）。
-   相邻且变化前后状态与证据完全相同的区间合并输出。
+     - instrument_fault：被有效故障时段并集遮蔽（fault_ids 只列实际覆盖
+       该半开区间的有效故障标识；标识集合变化处切段——首尾相接的故障
+       [a,b)+[b,c) 在 b 处各自单列，重叠处列全体在场标识）。
+   相邻且变化前后状态与证据完全相同的区间合并输出（相接故障两侧故障标识
+   不同，故不会误合并）。
 """
 from __future__ import annotations
 
@@ -175,47 +178,57 @@ def _mask_evidence_segments(
 ) -> list[EvidenceSeg]:
     """用快照有效故障时段的并集遮蔽带证据区段。
 
-    与 app.evaluation 的审定遮蔽同一条切分规则：取原始区段边界与故障并集
-    边界的并集再切分；被任一故障半开区间覆盖的原子段记为 unknown
-    （unknown_reason=instrument_fault，附覆盖它的故障标识），未遮蔽部分
-    原样保留（含原证据）。故障边界据此切断连续超限。
-    """
-    intervals = [
-        Interval(parse_stored(f["start_at"]), parse_stored(f["end_at"]))
-        for f in fault_rows
-    ]
-    fault_union = union_intervals(intervals, clip_start=win_start, clip_end=win_end)
-    if not fault_union:
-        return segs
+    与 app.evaluation 的审定遮蔽同一条切分规则：取原始区段边界、故障并集
+    边界与**每个原始故障各自边界**的并集再切分；被任一故障半开区间覆盖的
+    原子段记为 unknown（unknown_reason=instrument_fault），未遮蔽部分原样
+    保留（含原证据）。故障并集边界仍切断连续超限。
 
-    # 建立“并集区间 -> 覆盖它的原始故障标识集”：逐并集区间收集所有与之
-    # 相交的原始登记标识（重叠故障可能在同一点上同时遮蔽）。
-    union_fault_ids: list[tuple[str, ...]] = []
-    for fu in fault_union:
+    证据归属按原子段逐段判定：fault_ids 只列**实际覆盖该原子段**的有效
+    故障标识。故障首尾相接（[a,b)+[b,c)）虽在并集中合并遮蔽、在状态上
+    连续为未知，但 b 处标识集合变化（[a,b) 仅前段、[b,c) 仅后段）必须切段，
+    不得把并集内全部标识误标到每个时刻；真正重叠的区间则在重叠原子段列出
+    全体在场标识。
+    """
+    # 裁剪到窗口内的原始故障（半开、空区间丢弃），与登记行一一对应
+    clipped: list[tuple[Interval, dict[str, Any]]] = []
+    for f in fault_rows:
+        s = max(parse_stored(f["start_at"]), win_start)
+        e = min(parse_stored(f["end_at"]), win_end)
+        if s < e:
+            clipped.append((Interval(s, e), f))
+    if not clipped:
+        return segs
+    # 遮蔽判定仍以并集为准（相接/重叠的故障连续遮蔽，状态上不切开）
+    fault_union = union_intervals([iv for iv, _ in clipped])
+
+    def _fault_ids_covering(t: datetime) -> tuple[str, ...]:
+        """实际覆盖时刻 t（半开 [start,end)）的原始故障标识（已排序、去重）。"""
         ids = sorted({
             f.get("fault_id", "")
-            for f in fault_rows
-            if parse_stored(f["start_at"]) < fu.end and parse_stored(f["end_at"]) > fu.start
+            for iv, f in clipped
+            if iv.start <= t < iv.end
         })
-        union_fault_ids.append(tuple(i for i in ids if i))
+        return tuple(i for i in ids if i)
 
     cuts: set[datetime] = {win_start, win_end}
     for seg in segs:
         cuts.add(seg.start)
         cuts.add(seg.end)
-    for fu in fault_union:
-        cuts.add(fu.start)
-        cuts.add(fu.end)
+    # 并集边界用于维持与审定一致的遮蔽切点；原始故障边界用于在标识集合
+    # 变化处（含首尾相接点）切段
+    for iv in (*fault_union, *(iv for iv, _ in clipped)):
+        cuts.add(iv.start)
+        cuts.add(iv.end)
     boundaries = sorted(cuts)
 
-    def _covering(t: datetime) -> int:
-        """返回覆盖时刻 t 的并集区间下标；未被遮蔽返回 -1。"""
-        for i, fu in enumerate(fault_union):
+    def _covered(t: datetime) -> bool:
+        """时刻 t 是否被故障并集遮蔽。"""
+        for fu in fault_union:
             if fu.start <= t < fu.end:
-                return i
+                return True
             if t < fu.start:
                 break
-        return -1
+        return False
 
     out: list[EvidenceSeg] = []
     for seg in segs:
@@ -228,12 +241,13 @@ def _mask_evidence_segments(
             b2 = min(b, seg.end)
             if a2 >= b2:
                 continue
-            idx = _covering(a2)
-            if idx >= 0:
+            if _covered(a2):
+                # 只列实际覆盖该原子段的有效故障标识；标识集合变化处已由
+                # 原始故障边界切段保证段内一致
                 out.append(EvidenceSeg(
                     a2, b2, "unknown",
                     unknown_reason=UNKNOWN_INSTRUMENT_FAULT,
-                    fault_ids=union_fault_ids[idx],
+                    fault_ids=_fault_ids_covering(a2),
                 ))
             else:
                 out.append(EvidenceSeg(a2, b2, seg.status,

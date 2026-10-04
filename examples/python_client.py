@@ -676,6 +676,63 @@ def fault_period_demo() -> None:
     assert [f["fault_id"] for f in old["snapshot"]["fault_periods"]] == ["fault-01"]
 
 
+def touching_fault_demo() -> None:
+    """首尾相接故障的证据归属：并集连续遮蔽，但 fault_ids 按实际覆盖分段。"""
+    show("相接故障的修订影响报告：f1=[00:02,00:05)、f2=[00:05,00:08) 各归各段")
+    # 00:00 一条正常读数保持整窗、01:00 终止采样（间隔 3600s 恰好合法）-> pass
+    _, w = call("POST", "/api/v1/windows", {
+        "name": "展柜F2-相接故障",
+        "start_at": "2026-10-01T00:00:00Z",
+        "end_at": "2026-10-01T01:00:00Z",
+        "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+        "max_continuous_exceed_seconds": 300, "max_sample_interval_seconds": 3600,
+    })
+    tw = w["id"]
+    assert submit(tw, "a", 1, 0, 20.0)[0] == 201
+    assert call("POST", f"/api/v1/windows/{tw}/readings",
+                {"reading_id": "z", "revision": 1,
+                 "measured_at": "2026-10-01T01:00:00Z",
+                 "temperature": 20.0})[0] == 201
+    tc1 = call("POST", f"/api/v1/windows/{tw}/certificates/issue",
+               {"note": "v1-无故障"})[1]
+    assert tc1["verdict"] == "pass"
+
+    # 首尾相接两故障：审定并集仍是连续一段 [00:02,00:08)
+    assert register_fault(tw, "touch-f1", 2, 5, "温感漂移")[0] == 201
+    assert register_fault(tw, "touch-f2", 5, 8, "温感漂移")[0] == 201
+    tc2 = call("POST", f"/api/v1/windows/{tw}/certificates/issue",
+               {"note": "v2-相接两故障"})[1]
+    assert tc2["verdict"] == "pending"
+    assert [(f["start"][11:16], f["end"][11:16])
+            for f in tc2["snapshot"]["evaluation"]["fault_periods"]] == \
+        [("00:02", "00:08")]
+
+    rep = call("GET", "/api/v1/certificates/revision-report"
+                      f"?old_certificate_id={tc1['id']}&new_certificate_id={tc2['id']}")[1]
+    assert [f["fault_id"] for f in rep["fault_periods_diff"]["added"]] == \
+        ["touch-f1", "touch-f2"]
+    changes = rep["timeline"]["changes"]
+    for c in changes:
+        print(c["start"][11:16], c["end"][11:16],
+              c["before"]["status"], "->", c["after"]["status"],
+              c["after"]["evidence"].get("fault_ids"))
+    # 接点 00:05 切段：两侧 before 证据同为读数 a，但 after 故障标识不同 -> 不合并
+    assert [(c["start"][11:16], c["end"][11:16],
+             c["after"]["evidence"]["fault_ids"]) for c in changes] == [
+        ("00:02", "00:05", ["touch-f1"]),
+        ("00:05", "00:08", ["touch-f2"])]
+    print("相接故障各自单列、接点切段 ✔")
+
+    # 拒绝语义不变：证书不存在 404；同证/跨窗口/版本倒序 422
+    assert call("GET", "/api/v1/certificates/revision-report"
+                       f"?old_certificate_id={tc1['id']}&new_certificate_id=99999")[0] == 404
+    assert call("GET", "/api/v1/certificates/revision-report"
+                       f"?old_certificate_id={tc1['id']}&new_certificate_id={tc1['id']}")[0] == 422
+    assert call("GET", "/api/v1/certificates/revision-report"
+                       f"?old_certificate_id={tc2['id']}&new_certificate_id={tc1['id']}")[0] == 422
+    print("拒绝语义保持（404/422）✔")
+
+
 def handover_demo() -> None:
     """展柜移交放行单：申请放行、幂等重放、拒绝路径、查询失效。"""
     show("移交放行单：申请放行（非空单号 + 非空窗口标识列表）")
@@ -1171,6 +1228,7 @@ def microsecond_demo() -> None:
 if __name__ == "__main__":
     main()
     fault_period_demo()
+    touching_fault_demo()
     handover_demo()
     cross_window_demo()
     verification_package_demo()

@@ -206,7 +206,9 @@
   （旧快照无该字段，按空处理）。跨证修订影响报告从两证**各自快照**还原
   故障造成的时间线变化：被遮蔽区间呈现为状态变为 `unknown`、证据为
   `{"unknown_reason":"instrument_fault","fault_ids":[...]}` 的半开区间，
-  故障时段本身的新增/变更/撤回移除列入新增的 `fault_periods_diff`
+  `fault_ids` 只列实际覆盖该区间的有效故障标识（标识集合变化处切段：首尾
+  相接的故障在接点各自单列、不互标；重叠处列全体在场标识），故障时段本身的
+  新增/变更/撤回移除列入新增的 `fault_periods_diff`
   （旧快照缺 `fault_periods` 字段视为空）。
 
 ### 窗口规则版本化修订
@@ -941,9 +943,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
       `boundary_gap`（边界无读数空白，附 `boundary_side`：`leading` 首读
       之前并给 `right_*` 首条读数、`trailing` 末读之后并给 `left_*` 末条
       读数、`empty` 整窗无读数两侧均无引用），或 `instrument_fault`
-      （被有效故障时段并集遮蔽，附 `fault_ids`：覆盖该区间的故障标识列表）。
+      （被有效故障时段并集遮蔽，附 `fault_ids`：**只列实际覆盖该半开区间
+      的有效故障标识**——标识集合变化处切段；首尾相接的故障
+      `[a,b)`+`[b,c)` 虽在并集中连续遮蔽，仍在 `b` 处切成两段、分别只列
+      各自标识，真正重叠处才列出全体在场标识）。
   - 相邻且变化前后**状态与证据均相同**的区间自动合并（被无变化区间隔开的
-    不合并）。
+    不合并；相接故障两侧的 `fault_ids` 不同，故不会跨越接点合并）。
 - `summary`：审定结论变化（`verdict_before/after`、中文标签、
   `verdict_direction` 改善/恶化/持平）、最长连续超限时长前后值与增量
   `max_continuous_exceeded_seconds_delta`、时间线变化区间数，以及一段
@@ -1089,6 +1094,40 @@ BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
 修订影响报告最小示例（`OLD_ID`、`NEW_ID` 为同一窗口两张已签发证书主键）：
 
 ```bash
+curl -sS "http://localhost:8000/api/v1/certificates/revision-report?old_certificate_id=$OLD_ID&new_certificate_id=$NEW_ID"
+```
+
+相接/重叠故障的证据归属（本轮）：两证仍只从各自**不可变快照**还原时间线，
+有效故障取**并集**遮蔽（遮蔽处一律未知、故障边界切断连续超限），但每个半开
+区间的 `fault_ids` **只列实际覆盖该区间的有效故障标识**，标识集合变化处切段。
+因此同一窗口先签发无故障证书，再先后登记首尾相接的 f1=`[00:02,00:05)`、
+f2=`[00:05,00:08)` 后重签，报告 `timeline.changes` 在接点 `00:05` 切成两段：
+`[00:02,00:05)` 的 `after.evidence.fault_ids` 只有 `["f1"]`、
+`[00:05,00:08)` 只有 `["f2"]`，不会把 `[00:02,00:08)` 整段同时标成 f1、f2；
+若两故障真正重叠（如 f1=`[00:02,00:06)`、f2=`[00:04,00:08)`），重叠段
+`[00:04,00:06)` 的 `fault_ids` 为 `["f1","f2"]`。相邻区间仅在变化前后
+**状态与两侧证据完全相同**时才合并（相接故障两侧 `fault_ids` 不同，故不合并）；
+旧快照没有 `fault_periods` 字段时按空处理。接口路径、方法、入参与响应结构不变，
+证书不存在（404）、两证相同/跨窗口/版本顺序错误（422）仍按原语义拒绝。
+
+```bash
+# 1) 首签（无故障）
+curl -sS -X POST http://localhost:8000/api/v1/windows/1/certificates/issue \
+  -H 'Content-Type: application/json' -d '{"note":"v1-无故障"}'   # -> OLD_ID
+
+# 2) 登记首尾相接的两段有效故障后重签
+curl -sS -X POST http://localhost:8000/api/v1/windows/1/fault-periods \
+  -H 'Content-Type: application/json' -d '{
+    "fault_id":"f1","start_at":"2026-10-01T00:02:00Z",
+    "end_at":"2026-10-01T00:05:00Z","reason":"温感漂移"}'
+curl -sS -X POST http://localhost:8000/api/v1/windows/1/fault-periods \
+  -H 'Content-Type: application/json' -d '{
+    "fault_id":"f2","start_at":"2026-10-01T00:05:00Z",
+    "end_at":"2026-10-01T00:08:00Z","reason":"温感漂移"}'
+curl -sS -X POST http://localhost:8000/api/v1/windows/1/certificates/issue \
+  -H 'Content-Type: application/json' -d '{"note":"v2-相接两故障"}'  # -> NEW_ID
+
+# 3) 报告：[00:02,00:05) 仅 f1、[00:05,00:08) 仅 f2
 curl -sS "http://localhost:8000/api/v1/certificates/revision-report?old_certificate_id=$OLD_ID&new_certificate_id=$NEW_ID"
 ```
 

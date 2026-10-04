@@ -11,6 +11,7 @@ from app.models import VERDICT_LABELS_ZH
 from app.report import (
     BOUNDARY_EMPTY,
     UNKNOWN_BOUNDARY_GAP,
+    UNKNOWN_INSTRUMENT_FAULT,
     UNKNOWN_SAMPLE_GAP,
     build_evidence_segments,
     build_revision_report,
@@ -28,15 +29,19 @@ def iso(minute: float, second: float = 0) -> str:
 
 
 def make_snapshot(readings, *, verdict=None, tmin=18.0, tmax=22.0,
-                  max_exceed=300.0, max_gap=120.0, window_id=1):
+                  max_exceed=300.0, max_gap=120.0, window_id=1,
+                  fault_periods=()):
     """构造与签发结构一致的快照；evaluation 用同一算法实算。"""
     parsed = [
         (parse_stored(r["measured_at"]), r["temperature"]) for r in readings
     ]
-    ev = evaluate(WS, WE, tmin, tmax, max_exceed, max_gap, parsed)
+    ev = evaluate(WS, WE, tmin, tmax, max_exceed, max_gap, parsed,
+                  fault_periods=[
+                      (parse_stored(s), parse_stored(e)) for s, e in fault_periods
+                  ])
     if verdict is not None:
         ev["verdict"] = verdict
-    return {
+    snap = {
         "window": {
             "id": window_id,
             "name": "case",
@@ -50,6 +55,14 @@ def make_snapshot(readings, *, verdict=None, tmin=18.0, tmax=22.0,
         "evaluation": ev,
         "readings": list(readings),
     }
+    if fault_periods:
+        snap["fault_periods"] = [
+            {"fault_id": fid, "start_at": s, "end_at": e,
+             "reason": "仪器故障", "status": "active"}
+            for fid, (s, e) in zip(
+                (f"f{i+1}" for i in range(len(fault_periods))), fault_periods)
+        ]
+    return snap
 
 
 def r(rid, rev, minute, temp, *, second=0):
@@ -132,6 +145,72 @@ def test_gap_equal_limit_is_not_unknown():
     assert segs[-1].status == "normal"
     assert segs[-1].unknown_reason is None
     assert segs[-1].evidence() == {"reading_id": "a", "revision": 1}
+
+
+def _fault_spans(snap):
+    """把相邻同 fault_ids 的 instrument_fault 原子段聚合为 (起, 止, ids)。"""
+    out = []
+    for s in build_evidence_segments(snap):
+        if (s.status != "unknown"
+                or s.unknown_reason != UNKNOWN_INSTRUMENT_FAULT):
+            continue
+        if out and out[-1][1] == s.start and out[-1][2] == s.fault_ids:
+            out[-1] = (out[-1][0], s.end, s.fault_ids)
+        else:
+            out.append((s.start, s.end, s.fault_ids))
+    return out
+
+
+def test_touching_faults_split_ids_at_junction():
+    """首尾相接 f1=[02,05)、f2=[05,08)：并集虽合并遮蔽，标识必须各自单列，
+    接点 05 处切段——不得把 [02,08) 整段同时标成 f1、f2。"""
+    snap = make_snapshot(
+        [r(f"r{m}", 1, m, 20.0) for m in range(61)],
+        max_gap=6000.0,
+        fault_periods=[(iso(2), iso(5)), (iso(5), iso(8))],
+    )
+    assert _fault_spans(snap) == [
+        (parse_stored(iso(2)), parse_stored(iso(5)), ("f1",)),
+        (parse_stored(iso(5)), parse_stored(iso(8)), ("f2",)),
+    ]
+    # 遮蔽语义不变：并集 [02,08) 整段未知，且 verdict 与审定一致（pending）
+    assert snap["evaluation"]["verdict"] == "pending"
+    assert [(f["start"], f["end"]) for f in snap["evaluation"]["fault_periods"]] == [
+        (iso(2), iso(8))]
+
+
+def test_overlapping_faults_list_all_present_ids():
+    """重叠 f1=[02,06)、f2=[04,08)：重叠原子段列全体在场标识，两侧各自单列。"""
+    snap = make_snapshot(
+        [r(f"r{m}", 1, m, 20.0) for m in range(61)],
+        max_gap=6000.0,
+        fault_periods=[(iso(2), iso(6)), (iso(4), iso(8))],
+    )
+    assert _fault_spans(snap) == [
+        (parse_stored(iso(2)), parse_stored(iso(4)), ("f1",)),
+        (parse_stored(iso(4)), parse_stored(iso(6)), ("f1", "f2")),
+        (parse_stored(iso(6)), parse_stored(iso(8)), ("f2",)),
+    ]
+
+
+def test_fault_attribution_cut_breaks_continuous_exceed():
+    """超温保持段被相接两故障遮蔽：遮蔽处仍为未知并切断连续超限（与审定同口径）。"""
+    # 00:00 一条 23°C 读数保持整窗（00:60 终止读数无自身区段）；限值 600s：
+    # 若不在 [02,08) 切断，连续超限 3600s 必 fail；切断后最长段 3120s 仍超 ->
+    # 这里再把限值抬到 3200s，则切断后 3120s 不超时、仅因未知判 pending。
+    snap = make_snapshot(
+        [r("a", 1, 0, 23.0), r("z", 1, 60, 23.0)],
+        max_exceed=3200.0, max_gap=6000.0,
+        fault_periods=[(iso(2), iso(5)), (iso(5), iso(8))],
+    )
+    ev = snap["evaluation"]
+    # [00,02) 120s + [02,08) 未知 + [08,60) 3120s；无遮蔽时本为连续 3600s
+    assert ev["max_continuous_exceeded_seconds"] == 3120.0
+    assert ev["verdict"] == "pending"
+    assert _fault_spans(snap) == [
+        (parse_stored(iso(2)), parse_stored(iso(5)), ("f1",)),
+        (parse_stored(iso(5)), parse_stored(iso(8)), ("f2",)),
+    ]
 
 
 # ------------------------------------------------------------ 读数差异
@@ -262,6 +341,45 @@ def test_no_status_change_returns_empty_timeline():
         max_gap=600.0,
     )
     assert changes == []
+
+
+def test_touching_fault_changes_split_at_junction_with_correct_ids():
+    """同一读数保持整窗：新增首尾相接两故障，变化区间必须在接点切成两段，
+    fault_ids 各列实际在场标识；两侧 before 证据完全相同也不得跨越接点合并。"""
+    readings = [r("a", 1, 0, 20.0), r("z", 1, 60, 20.0)]
+    old = make_snapshot(readings, max_gap=6000.0)
+    new = make_snapshot(readings, max_gap=6000.0,
+                        fault_periods=[(iso(2), iso(5)), (iso(5), iso(8))])
+    changes = build_revision_report(
+        make_cert(1, 1, old), make_cert(2, 2, new))["timeline"]["changes"]
+    assert [(c["start"], c["end"], c["before"], c["after"]) for c in changes] == [
+        (iso(2), iso(5),
+         {"status": "normal", "evidence": {"reading_id": "a", "revision": 1}},
+         {"status": "unknown", "evidence": {
+             "unknown_reason": UNKNOWN_INSTRUMENT_FAULT, "fault_ids": ["f1"]}}),
+        (iso(5), iso(8),
+         {"status": "normal", "evidence": {"reading_id": "a", "revision": 1}},
+         {"status": "unknown", "evidence": {
+             "unknown_reason": UNKNOWN_INSTRUMENT_FAULT, "fault_ids": ["f2"]}}),
+    ]
+    # 合并规则的否定面：after 证据不同（f1 vs f2）即不合并
+    assert all(c["duration_seconds"] == 180.0 for c in changes)
+
+
+def test_overlapping_fault_change_lists_both_ids_in_overlap():
+    """重叠故障的变化区间：重叠原子段 after 证据列 f1+f2，两侧各单列。"""
+    readings = [r("a", 1, 0, 20.0), r("z", 1, 60, 20.0)]
+    old = make_snapshot(readings, max_gap=6000.0)
+    new = make_snapshot(readings, max_gap=6000.0,
+                        fault_periods=[(iso(2), iso(6)), (iso(4), iso(8))])
+    changes = build_revision_report(
+        make_cert(1, 1, old), make_cert(2, 2, new))["timeline"]["changes"]
+    assert [(c["start"], c["end"],
+             c["after"]["evidence"]["fault_ids"]) for c in changes] == [
+        (iso(2), iso(4), ["f1"]),
+        (iso(4), iso(6), ["f1", "f2"]),
+        (iso(6), iso(8), ["f2"]),
+    ]
 
 
 # ------------------------------------------------------------ 合并规则

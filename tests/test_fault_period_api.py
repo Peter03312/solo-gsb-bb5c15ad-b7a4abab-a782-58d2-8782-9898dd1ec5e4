@@ -477,3 +477,67 @@ def test_report_old_snapshot_without_fault_field_treated_as_empty(client):
     assert rep["fault_periods_diff"]["added_count"] == 1
     assert rep["timeline"]["changes"][0]["after"]["evidence"][
         "unknown_reason"] == "instrument_fault"
+
+
+def test_report_touching_faults_attribute_ids_per_half_interval(client):
+    """首尾相接 f1=[02,05)、f2=[05,08)：报告时间线不得把整段 [02,08) 同时
+    标成 f1、f2；接点切段，各半开区间只列实际覆盖它的有效故障标识。"""
+    # 00:00 一条正常读数保持整窗，00:60 终止读数；间隔 3600s 恰好合法
+    make_window(client, max_gap=3600.0)
+    client.post("/api/v1/windows/1/readings", json=reading("a", 0, 20.0))
+    client.post("/api/v1/windows/1/readings", json=reading("z", 60, 20.0))
+    c1 = client.post("/api/v1/windows/1/certificates/issue",
+                     json={"note": "v1-无故障"}).json()
+    assert c1["verdict"] == "pass"
+    client.post("/api/v1/windows/1/fault-periods", json=fault("f1", 2, 5))
+    client.post("/api/v1/windows/1/fault-periods", json=fault("f2", 5, 8))
+    c2 = client.post("/api/v1/windows/1/certificates/issue",
+                     json={"note": "v2-相接两故障"}).json()
+    assert c2["verdict"] == "pending"
+
+    rep = client.get(
+        "/api/v1/certificates/revision-report",
+        params={"old_certificate_id": c1["id"], "new_certificate_id": c2["id"]},
+    ).json()
+    # 故障差异：f1、f2 均为新增；审定固化的并集仍是连续一段 [02,08)
+    assert [x["fault_id"] for x in rep["fault_periods_diff"]["added"]] == ["f1", "f2"]
+    assert c2["snapshot"]["evaluation"]["fault_periods"] == [{
+        "start": iso(2), "end": iso(8), "duration_seconds": 360.0}]
+
+    # 时间线变化在接点 05 切成两段：before 证据同为读数 a，但 after 故障标识
+    # 不同，故不合并
+    changes = rep["timeline"]["changes"]
+    assert [(c["start"], c["end"]) for c in changes] == [
+        (iso(2), iso(5)), (iso(5), iso(8))]
+    assert changes[0]["before"]["evidence"] == {"reading_id": "a", "revision": 1}
+    assert changes[0]["after"]["evidence"] == {
+        "unknown_reason": "instrument_fault", "fault_ids": ["f1"]}
+    assert changes[1]["before"]["evidence"] == {"reading_id": "a", "revision": 1}
+    assert changes[1]["after"]["evidence"] == {
+        "unknown_reason": "instrument_fault", "fault_ids": ["f2"]}
+    assert rep["timeline"]["change_count"] == 2
+
+
+def test_report_overlapping_faults_list_all_present_ids(client):
+    """重叠 f1=[02,06)、f2=[04,08)：重叠段 [04,06) 证据列 f1+f2。"""
+    make_window(client, max_gap=3600.0)
+    client.post("/api/v1/windows/1/readings", json=reading("a", 0, 20.0))
+    client.post("/api/v1/windows/1/readings", json=reading("z", 60, 20.0))
+    c1 = client.post("/api/v1/windows/1/certificates/issue",
+                     json={"note": "v1"}).json()
+    client.post("/api/v1/windows/1/fault-periods", json=fault("f1", 2, 6))
+    client.post("/api/v1/windows/1/fault-periods", json=fault("f2", 4, 8))
+    c2 = client.post("/api/v1/windows/1/certificates/issue",
+                     json={"note": "v2"}).json()
+
+    rep = client.get(
+        "/api/v1/certificates/revision-report",
+        params={"old_certificate_id": c1["id"], "new_certificate_id": c2["id"]},
+    ).json()
+    changes = rep["timeline"]["changes"]
+    assert [(c["start"], c["end"], c["after"]["evidence"]["fault_ids"])
+            for c in changes] == [
+        (iso(2), iso(4), ["f1"]),
+        (iso(4), iso(6), ["f1", "f2"]),
+        (iso(6), iso(8), ["f2"]),
+    ]
