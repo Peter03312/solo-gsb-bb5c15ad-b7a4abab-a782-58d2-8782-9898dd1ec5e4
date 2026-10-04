@@ -477,3 +477,111 @@ def test_report_old_snapshot_without_fault_field_treated_as_empty(client):
     assert rep["fault_periods_diff"]["added_count"] == 1
     assert rep["timeline"]["changes"][0]["after"]["evidence"][
         "unknown_reason"] == "instrument_fault"
+
+
+def test_report_abutting_faults_attribute_each_interval_to_present_fault(client):
+    """缺陷回归：新快照有效故障 f1=[02,05)、f2=[05,08) 首尾相接，报告不得
+    把 [02,08) 整体同时标为 f1、f2；每个半开区间只列实际覆盖它的标识，
+    标识集合变化处在接点切段；故障并集遮蔽与切断超限语义不变，接口结构
+    与拒绝语义保持兼容。"""
+    # 超限读数 a 保持 [00,10) 共 600s（限值 300s）-> fail；其后读数正常。
+    # 间隔均 ≤3600s 合法；故障并集 [02,08) 遮蔽后两侧超限段各 120s，
+    # 切断累计后不再超时 -> pending。
+    make_window(client, max_gap=3600.0)
+    client.post("/api/v1/windows/1/readings",
+                json=reading("a", 0, 23.0)).raise_for_status()
+    client.post("/api/v1/windows/1/readings",
+                json=reading("b", 10, 20.0)).raise_for_status()
+    client.post("/api/v1/windows/1/readings",
+                json=reading("c", 60, 20.0)).raise_for_status()
+    c1 = client.post("/api/v1/windows/1/certificates/issue",
+                     json={"note": "v1"}).json()
+    assert c1["verdict"] == "fail"
+
+    # 登记两条首尾相接的有效故障后重签 -> pending（并集 [02,08) 遮蔽）
+    r1 = client.post("/api/v1/windows/1/fault-periods",
+                     json=fault("f1", 2, 5))
+    r2 = client.post("/api/v1/windows/1/fault-periods",
+                     json=fault("f2", 5, 8))
+    assert r1.status_code == 201 and r2.status_code == 201
+    c2 = client.post("/api/v1/windows/1/certificates/issue",
+                     json={"note": "v2"}).json()
+    assert c2["verdict"] == "pending"
+    # 快照固化的故障并集仍相接合并为 [02,08)（审定口径不变）
+    assert [fp["fault_id"] for fp in c2["snapshot"]["fault_periods"]] == [
+        "f1", "f2"]
+    assert c2["snapshot"]["evaluation"]["fault_periods"] == [{
+        "start": iso(2), "end": iso(8), "duration_seconds": 360.0}]
+
+    rep = client.get(
+        "/api/v1/certificates/revision-report",
+        params={"old_certificate_id": c1["id"], "new_certificate_id": c2["id"]},
+    )
+    assert rep.status_code == 200, rep.text
+    body = rep.json()
+    # 响应结构与字段保持兼容
+    assert set(body) == {
+        "window", "old_certificate", "new_certificate", "rules_diff",
+        "readings_diff", "fault_periods_diff", "timeline", "summary"}
+    changes = body["timeline"]["changes"]
+    assert [(ch["start"], ch["end"]) for ch in changes] == [
+        (iso(2), iso(5)), (iso(5), iso(8))]
+    assert changes[0]["before"] == {"status": "exceeded", "evidence": {
+        "reading_id": "a", "revision": 1}}
+    assert changes[0]["after"] == {"status": "unknown", "evidence": {
+        "unknown_reason": "instrument_fault", "fault_ids": ["f1"]}}
+    assert changes[1]["before"] == {"status": "exceeded", "evidence": {
+        "reading_id": "a", "revision": 1}}
+    assert changes[1]["after"] == {"status": "unknown", "evidence": {
+        "unknown_reason": "instrument_fault", "fault_ids": ["f2"]}}
+
+    # 拒绝语义不变：证书不存在 404；跨窗口 422；版本顺序错误 422
+    missing = client.get(
+        "/api/v1/certificates/revision-report",
+        params={"old_certificate_id": 99999, "new_certificate_id": c2["id"]})
+    assert missing.status_code == 404
+
+    other = client.post("/api/v1/windows", json={
+        "name": "other", "start_at": iso(0), "end_at": iso(60),
+        "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+        "max_continuous_exceed_seconds": 300.0,
+        "max_sample_interval_seconds": 3600.0})
+    assert other.status_code == 201
+    co = client.post("/api/v1/windows/2/certificates/issue").json()
+    cross = client.get(
+        "/api/v1/certificates/revision-report",
+        params={"old_certificate_id": c1["id"],
+                "new_certificate_id": co["id"]})
+    assert cross.status_code == 422
+    order = client.get(
+        "/api/v1/certificates/revision-report",
+        params={"old_certificate_id": c2["id"],
+                "new_certificate_id": c1["id"]})
+    assert order.status_code == 422
+
+
+def test_report_overlapping_faults_list_all_present_ids(client):
+    """重叠故障 f1=[02,06)、f2=[04,08)：重叠段 [04,06) 列全体在场标识，
+    两侧单列。"""
+    make_window(client, max_gap=3600.0)
+    client.post("/api/v1/windows/1/readings",
+                json=reading("a", 0, 23.0)).raise_for_status()
+    client.post("/api/v1/windows/1/readings",
+                json=reading("b", 60, 23.0)).raise_for_status()
+    c1 = client.post("/api/v1/windows/1/certificates/issue").json()
+    client.post("/api/v1/windows/1/fault-periods",
+                json=fault("f1", 2, 6)).raise_for_status()
+    client.post("/api/v1/windows/1/fault-periods",
+                json=fault("f2", 4, 8)).raise_for_status()
+    c2 = client.post("/api/v1/windows/1/certificates/issue").json()
+    body = client.get(
+        "/api/v1/certificates/revision-report",
+        params={"old_certificate_id": c1["id"], "new_certificate_id": c2["id"]},
+    ).json()
+    changes = body["timeline"]["changes"]
+    assert [(ch["start"], ch["end"],
+             ch["after"]["evidence"]["fault_ids"]) for ch in changes] == [
+        (iso(2), iso(4), ["f1"]),
+        (iso(4), iso(6), ["f1", "f2"]),
+        (iso(6), iso(8), ["f2"]),
+    ]

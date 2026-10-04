@@ -205,9 +205,14 @@
   及按其重算的结果**（`snapshot.fault_periods`）；旧证书快照原样保留
   （旧快照无该字段，按空处理）。跨证修订影响报告从两证**各自快照**还原
   故障造成的时间线变化：被遮蔽区间呈现为状态变为 `unknown`、证据为
-  `{"unknown_reason":"instrument_fault","fault_ids":[...]}` 的半开区间，
-  故障时段本身的新增/变更/撤回移除列入新增的 `fault_periods_diff`
-  （旧快照缺 `fault_periods` 字段视为空）。
+  `{"unknown_reason":"instrument_fault","fault_ids":[...]}` 的半开区间；
+  每个半开区间的 `fault_ids` **只列实际覆盖该区间的有效故障标识**——
+  首尾相接的故障在接点处各自分段单列（如 `f1=[02,05)`、`f2=[05,08)`
+  不会被整体标成 `["f1","f2"]`），重叠时段列全体在场标识，标识集合变化
+  处切段，仅前后状态及两侧证据完全相同的相邻变化区间才合并；遮蔽范围仍
+  取故障**并集**且故障边界切断连续超限。故障时段本身的新增/变更/撤回
+  移除列入新增的 `fault_periods_diff`（旧快照缺 `fault_periods` 字段
+  视为空）。
 
 ### 窗口规则版本化修订
 
@@ -941,7 +946,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
       `boundary_gap`（边界无读数空白，附 `boundary_side`：`leading` 首读
       之前并给 `right_*` 首条读数、`trailing` 末读之后并给 `left_*` 末条
       读数、`empty` 整窗无读数两侧均无引用），或 `instrument_fault`
-      （被有效故障时段并集遮蔽，附 `fault_ids`：覆盖该区间的故障标识列表）。
+      （被有效故障时段并集遮蔽，附 `fault_ids`：**只列实际覆盖该半开
+      区间的有效故障标识**——首尾相接的两故障 `f1=[a,b)`、`f2=[b,c)`
+      在接点 `b` 处分段，`[a,b)` 仅列 `f1`、`[b,c)` 仅列 `f2`（半开口径，
+      接点属于后段）；重叠时段列全体在场标识，如
+      `["f1","f2"]`；标识集合变化处必然切段）。遮蔽与否仍只取决于故障
+      **并集**（相接/重叠合并后连续遮蔽、故障边界切断连续超限），变化的
+      只是各段的证据归属，不影响状态分区。
   - 相邻且变化前后**状态与证据均相同**的区间自动合并（被无变化区间隔开的
     不合并）。
 - `summary`：审定结论变化（`verdict_before/after`、中文标签、
@@ -1020,6 +1031,50 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   }
 }
 ```
+
+**本轮用法：相接故障的证据归属修正。** 当新快照中两条有效故障首尾相接
+（如 `f1=[02,05)`、`f2=[05,08)`）时，报告在接点处切成两个半开变化区间，
+各自只列实际在场故障；重叠故障的重叠段则列全体在场标识。故障**并集**
+遮蔽与“故障边界切断连续超限”口径不变，`timeline.changes` 之外的字段
+（规则、读数、故障时段差异、汇总、证书引用与快照）与 HTTP 接口的路径、
+方法、入参、响应结构均保持兼容。调用示例：
+
+```bash
+# 1) 旧版证书签发（无故障）；2) 登记两条首尾相接的有效故障后重签新版
+curl -sX POST http://localhost:8000/api/v1/windows/1/fault-periods \
+  -H 'Content-Type: application/json' \
+  -d '{"fault_id":"f1","start_at":"2026-10-01T00:02:00Z",
+       "end_at":"2026-10-01T00:05:00Z","reason":"温感漂移：该时段读数不可信"}'
+curl -sX POST http://localhost:8000/api/v1/windows/1/fault-periods \
+  -H 'Content-Type: application/json' \
+  -d '{"fault_id":"f2","start_at":"2026-10-01T00:05:00Z",
+       "end_at":"2026-10-01T00:08:00Z","reason":"更换探头后仍失准"}'
+curl -sX POST http://localhost:8000/api/v1/windows/1/certificates/issue \
+  -H 'Content-Type: application/json' -d '{"note":"登记两条相接故障后重签"}'
+
+# 3) 同一窗口、旧版在前新版在后生成修订影响报告
+curl -s "http://localhost:8000/api/v1/certificates/revision-report?old_certificate_id=1&new_certificate_id=2"
+```
+
+```json
+// timeline.changes 节选：[02,05) 只挂 f1，[05,08) 只挂 f2，互不误指
+[
+  {"start": "2026-10-01T00:02:00Z", "end": "2026-10-01T00:05:00Z",
+   "duration_seconds": 180.0,
+   "before": {"status": "exceeded", "evidence": {"reading_id": "a", "revision": 1}},
+   "after":  {"status": "unknown",
+              "evidence": {"unknown_reason": "instrument_fault", "fault_ids": ["f1"]}}},
+  {"start": "2026-10-01T00:05:00Z", "end": "2026-10-01T00:08:00Z",
+   "duration_seconds": 180.0,
+   "before": {"status": "exceeded", "evidence": {"reading_id": "a", "revision": 1}},
+   "after":  {"status": "unknown",
+              "evidence": {"unknown_reason": "instrument_fault", "fault_ids": ["f2"]}}}
+]
+```
+
+> 若两故障改为重叠（如 `f1=[02,06)`、`f2=[04,08)`），则输出三段：
+> `[02,04)` → `["f1"]`、`[04,06)` → `["f1","f2"]`、`[06,08)` → `["f2"]`。
+> 证书不存在仍为 `404`；跨窗口、两 ID 相同或版本顺序错误仍为 `422`。
 
 ### 错误约定
 

@@ -317,6 +317,32 @@ api POST "/api/v1/windows/$FID/fault-periods" '{"fault_id":"fault-01","start_at"
 api GET "/api/v1/windows/$FID/fault-periods" | python3 -c "import sys,json;print([(f['fault_id'],f['status']) for f in json.load(sys.stdin)])"
 api GET "/api/v1/windows/$FID/fault-periods?active_only=true" | python3 -c "import sys,json;print('active:',json.load(sys.stdin))"
 
+echo "== 15c. 相接故障的修订影响报告证据归属（每个半开区间只列在场故障标识）=="
+AW=$(api POST /api/v1/windows '{
+  "name": "展柜G-相接故障证据",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T01:00:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 3600
+}')
+AID=$(echo "$AW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+# [00:00]23 超限保持到 [00:10]20 正常 -> [01:00]20（覆盖终止）
+api POST "/api/v1/windows/$AID/readings" '{"reading_id":"a","revision":1,"measured_at":"2026-10-01T00:00:00Z","temperature":23.0}' >/dev/null
+api POST "/api/v1/windows/$AID/readings" '{"reading_id":"b","revision":1,"measured_at":"2026-10-01T00:10:00Z","temperature":20.0}' >/dev/null
+api POST "/api/v1/windows/$AID/readings" '{"reading_id":"c","revision":1,"measured_at":"2026-10-01T01:00:00Z","temperature":20.0}' >/dev/null
+AC1=$(api POST "/api/v1/windows/$AID/certificates/issue" '{"note":"v1-无故障"}')
+AC1_ID=$(echo "$AC1" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+# 两条首尾相接的有效故障：f1=[02,05)、f2=[05,08)（半开，接点属后段）
+api POST "/api/v1/windows/$AID/fault-periods" '{"fault_id":"f1","start_at":"2026-10-01T00:02:00Z","end_at":"2026-10-01T00:05:00Z","reason":"温感漂移"}' >/dev/null
+api POST "/api/v1/windows/$AID/fault-periods" '{"fault_id":"f2","start_at":"2026-10-01T00:05:00Z","end_at":"2026-10-01T00:08:00Z","reason":"换探头后仍失准"}' >/dev/null
+AC2=$(api POST "/api/v1/windows/$AID/certificates/issue" '{"note":"v2-两条相接故障"}')
+AC2_ID=$(echo "$AC2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+echo "-- 报告：[02,05) 仅 f1、[05,08) 仅 f2；故障并集仍遮蔽 [02,08) 并切断超限 --"
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$AC1_ID&new_certificate_id=$AC2_ID" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);[print(c['start'][11:16],c['end'][11:16],c['before']['status'],'->',c['after']['status'],c['after']['evidence'].get('fault_ids')) for c in d['timeline']['changes']];print('结论',d['summary']['verdict_before'],'->',d['summary']['verdict_after'])"
+
 echo "== 16. 已签发证书撤销（单独建窗口演示；撤销只改有效性，版本/结论/快照不动）=="
 VW=$(api POST /api/v1/windows '{
   "name": "展柜G-证书撤销",

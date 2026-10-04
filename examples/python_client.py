@@ -676,6 +676,53 @@ def fault_period_demo() -> None:
     assert [f["fault_id"] for f in old["snapshot"]["fault_periods"]] == ["fault-01"]
 
 
+def abutting_fault_evidence_demo() -> None:
+    """相接故障的证据归属：每个半开区间只列实际覆盖它的故障标识。"""
+    show("修订影响报告：首尾相接故障 f1=[02,05)、f2=[05,08) 的证据分段")
+    _, w = call("POST", "/api/v1/windows", {
+        "name": "展柜G-相接故障证据",
+        "start_at": "2026-10-01T00:00:00Z",
+        "end_at": "2026-10-01T01:00:00Z",
+        "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+        "max_continuous_exceed_seconds": 300,
+        "max_sample_interval_seconds": 3600,
+    })
+    wid = w["id"]
+    # [00:00]23 超限保持到 [00:10]20 正常 -> [01:00]20（覆盖终止）
+    assert submit(wid, "a", 1, 0, 23.0)[0] == 201
+    assert submit(wid, "b", 1, 10, 20.0)[0] == 201
+    assert call("POST", f"/api/v1/windows/{wid}/readings", {
+        "reading_id": "c", "revision": 1,
+        "measured_at": "2026-10-01T01:00:00Z", "temperature": 20.0})[0] == 201
+    c1 = call("POST", f"/api/v1/windows/{wid}/certificates/issue",
+              {"note": "v1-无故障"})[1]
+    assert c1["verdict"] == "fail"
+    assert register_fault(wid, "f1", 2, 5, "温感漂移")[0] == 201
+    assert register_fault(wid, "f2", 5, 8, "换探头后仍失准")[0] == 201
+    c2 = call("POST", f"/api/v1/windows/{wid}/certificates/issue",
+              {"note": "v2-两条相接故障"})[1]
+    # 故障并集仍相接合并为 [02,08) 遮蔽、切断超限；结论 fail -> pending
+    assert c2["snapshot"]["evaluation"]["fault_periods"] == [{
+        "start": "2026-10-01T00:02:00Z", "end": "2026-10-01T00:08:00Z",
+        "duration_seconds": 360.0}]
+    rep = call("GET", "/api/v1/certificates/revision-report"
+                      f"?old_certificate_id={c1['id']}&new_certificate_id={c2['id']}")[1]
+    got = [(ch["start"][11:16], ch["end"][11:16],
+            ch["after"]["evidence"]["fault_ids"])
+           for ch in rep["timeline"]["changes"]]
+    print("时间线变化（起, 止, 在场故障标识）:", got)
+    assert got == [("00:02", "00:05", ["f1"]), ("00:05", "00:08", ["f2"])]
+    print("结论:", rep["summary"]["verdict_before"], "->",
+          rep["summary"]["verdict_after"])
+    assert rep["summary"]["verdict_after"] == "pending"
+
+    # 拒绝语义不变：证书不存在 404；版本顺序错误 422
+    assert call("GET", "/api/v1/certificates/revision-report"
+                       f"?old_certificate_id=99999&new_certificate_id={c2['id']}")[0] == 404
+    assert call("GET", "/api/v1/certificates/revision-report"
+                       f"?old_certificate_id={c2['id']}&new_certificate_id={c1['id']}")[0] == 422
+
+
 def handover_demo() -> None:
     """展柜移交放行单：申请放行、幂等重放、拒绝路径、查询失效。"""
     show("移交放行单：申请放行（非空单号 + 非空窗口标识列表）")
@@ -1171,6 +1218,7 @@ def microsecond_demo() -> None:
 if __name__ == "__main__":
     main()
     fault_period_demo()
+    abutting_fault_evidence_demo()
     handover_demo()
     cross_window_demo()
     verification_package_demo()

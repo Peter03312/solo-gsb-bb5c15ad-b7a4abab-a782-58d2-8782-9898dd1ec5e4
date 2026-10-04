@@ -28,15 +28,23 @@ def iso(minute: float, second: float = 0) -> str:
 
 
 def make_snapshot(readings, *, verdict=None, tmin=18.0, tmax=22.0,
-                  max_exceed=300.0, max_gap=120.0, window_id=1):
-    """构造与签发结构一致的快照；evaluation 用同一算法实算。"""
+                  max_exceed=300.0, max_gap=120.0, window_id=1, faults=()):
+    """构造与签发结构一致的快照；evaluation 用同一算法实算。
+
+    faults 为 (fault_id, start_iso, end_iso) 序列：模拟新快照固化有效
+    故障时段（旧快照不传即缺该字段，按空处理）。
+    """
     parsed = [
         (parse_stored(r["measured_at"]), r["temperature"]) for r in readings
     ]
-    ev = evaluate(WS, WE, tmin, tmax, max_exceed, max_gap, parsed)
+    ev = evaluate(
+        WS, WE, tmin, tmax, max_exceed, max_gap, parsed,
+        fault_periods=[(parse_stored(s), parse_stored(e))
+                       for _, s, e in faults],
+    )
     if verdict is not None:
         ev["verdict"] = verdict
-    return {
+    snap = {
         "window": {
             "id": window_id,
             "name": "case",
@@ -50,6 +58,13 @@ def make_snapshot(readings, *, verdict=None, tmin=18.0, tmax=22.0,
         "evaluation": ev,
         "readings": list(readings),
     }
+    if faults:
+        snap["fault_periods"] = [
+            {"fault_id": fid, "start_at": s, "end_at": e,
+             "reason": "故障登记", "status": "active"}
+            for fid, s, e in faults
+        ]
+    return snap
 
 
 def r(rid, rev, minute, temp, *, second=0):
@@ -132,6 +147,123 @@ def test_gap_equal_limit_is_not_unknown():
     assert segs[-1].status == "normal"
     assert segs[-1].unknown_reason is None
     assert segs[-1].evidence() == {"reading_id": "a", "revision": 1}
+
+
+# ------------------------------------------------------- 故障遮蔽证据归属
+
+def _fault_snapshots(readings, old_faults=(), new_faults=(), **kw):
+    old = make_snapshot(readings, faults=old_faults, **kw)
+    new = make_snapshot(readings, faults=new_faults, **kw)
+    return old, new
+
+
+def test_abutting_faults_split_evidence_at_junction():
+    """首尾相接的 f1=[02,05)、f2=[05,08)：各半开区间只挂实际在场故障。
+
+    缺陷回归：旧实现先把相接故障并入同一并集区间再整体挂“并集内全部
+    相交标识”，[02,08) 被同时误标为 f1、f2。
+    """
+    readings = [r("a", 1, 0, 23.0), r("b", 1, 10, 23.0)]  # 间隔 600s
+    new = make_snapshot(
+        readings, max_gap=600.0,
+        faults=[("f1", iso(2), iso(5)), ("f2", iso(5), iso(8))])
+    segs = build_evidence_segments(new)
+    masked = [(s.start, s.end, s.fault_ids) for s in segs
+              if s.status == "unknown"
+              and s.unknown_reason == "instrument_fault"]
+    # [02,05) 仅 f1；[05,08) 仅 f2——接点 05 属于后段（半开）
+    assert masked == [
+        (parse_stored(iso(2)), parse_stored(iso(5)), ("f1",)),
+        (parse_stored(iso(5)), parse_stored(iso(8)), ("f2",)),
+    ]
+
+
+def test_overlapping_faults_list_all_present_ids():
+    """重叠时段列全体在场标识；仅重叠一方覆盖的区间单列。"""
+    readings = [r("a", 1, 0, 23.0), r("b", 1, 10, 23.0)]
+    new = make_snapshot(
+        readings, max_gap=600.0,
+        faults=[("f1", iso(2), iso(6)), ("f2", iso(4), iso(8))])
+    masked = [(s.start, s.end, s.fault_ids) for s in build_evidence_segments(new)
+              if s.status == "unknown"
+              and s.unknown_reason == "instrument_fault"]
+    assert masked == [
+        (parse_stored(iso(2)), parse_stored(iso(4)), ("f1",)),
+        (parse_stored(iso(4)), parse_stored(iso(6)), ("f1", "f2")),
+        (parse_stored(iso(6)), parse_stored(iso(8)), ("f2",)),
+    ]
+
+
+def test_fault_id_set_change_inside_held_segment_is_not_merged_in_report():
+    """f1=[02,05)、f2=[05,08) 遮蔽同一条超限保持段：报告切成两个变化区间，
+    after 证据各自单列，不因状态同为 unknown 而合并。"""
+    readings = [r("a", 1, 0, 23.0), r("b", 1, 10, 23.0)]
+    old, new = _fault_snapshots(
+        readings,
+        new_faults=[("f1", iso(2), iso(5)), ("f2", iso(5), iso(8))],
+        max_gap=600.0)
+    report = build_revision_report(make_cert(1, 1, old), make_cert(2, 2, new))
+    changes = report["timeline"]["changes"]
+    assert [(c["start"], c["end"]) for c in changes] == [
+        (iso(2), iso(5)), (iso(5), iso(8))]
+    assert changes[0]["before"] == {"status": "exceeded",
+                                    "evidence": {"reading_id": "a", "revision": 1}}
+    assert changes[0]["after"] == {"status": "unknown", "evidence": {
+        "unknown_reason": "instrument_fault", "fault_ids": ["f1"]}}
+    assert changes[1]["after"] == {"status": "unknown", "evidence": {
+        "unknown_reason": "instrument_fault", "fault_ids": ["f2"]}}
+
+
+def test_abutting_faults_across_reading_boundary_keep_per_piece_evidence():
+    """接点恰落在读数边界上：两段 after 证据（f1/f2）与 before 读数证据
+    （a/b）都不同，不合并。"""
+    readings = [r("a", 1, 0, 23.0), r("b", 1, 5, 24.0), r("c", 1, 10, 23.0)]
+    old, new = _fault_snapshots(
+        readings,
+        new_faults=[("f1", iso(2), iso(5)), ("f2", iso(5), iso(8))],
+        max_gap=600.0)
+    changes = build_revision_report(
+        make_cert(1, 1, old), make_cert(2, 2, new))["timeline"]["changes"]
+    assert [(c["start"], c["end"]) for c in changes] == [
+        (iso(2), iso(5)), (iso(5), iso(8))]
+    assert changes[0]["before"] == {"status": "exceeded",
+                                    "evidence": {"reading_id": "a", "revision": 1}}
+    assert changes[0]["after"]["evidence"]["fault_ids"] == ["f1"]
+    assert changes[1]["before"] == {"status": "exceeded",
+                                    "evidence": {"reading_id": "b", "revision": 1}}
+    assert changes[1]["after"]["evidence"]["fault_ids"] == ["f2"]
+
+
+def test_disjoint_faults_separated_by_unchanged_region_do_not_merge():
+    """f1=[02,04)、f2=[06,08)：两段变化不相邻（中间 [04,06) 仍超限、无变化），
+    不合并；未遮蔽段保持原状态与读数证据。"""
+    readings2 = [r("a", 1, 0, 23.0), r("z", 1, 10, 23.0)]
+    old2, new2 = _fault_snapshots(
+        readings2,
+        new_faults=[("f1", iso(2), iso(4)), ("f2", iso(6), iso(8))],
+        max_gap=600.0)
+    changes2 = build_revision_report(
+        make_cert(1, 1, old2), make_cert(2, 2, new2))["timeline"]["changes"]
+    assert [(c["start"], c["end"], c["after"]["evidence"]["fault_ids"])
+            for c in changes2] == [
+        (iso(2), iso(4), ["f1"]), (iso(6), iso(8), ["f2"])]
+
+
+def test_fault_mask_status_partition_unchanged():
+    """修复只改证据归属：状态分区与审定算法结果一致（相接故障仍连续未知、
+    切断超限）。"""
+    readings = [r("a", 1, 0, 23.0), r("b", 1, 10, 23.0)]
+    new = make_snapshot(
+        readings, max_gap=600.0,
+        faults=[("f1", iso(2), iso(5)), ("f2", iso(5), iso(8))])
+    # 审定结果：故障并集仍为相接合并后的 [02,08) 单段未知
+    assert new["evaluation"]["fault_periods"] == [{
+        "start": iso(2), "end": iso(8), "duration_seconds": 360.0}]
+    assert new["evaluation"]["verdict"] == "pending"
+    segs = build_evidence_segments(new)
+    assert segs[0].start == WS and segs[-1].end == WE
+    for x, y in zip(segs, segs[1:]):
+        assert x.end == y.start
 
 
 # ------------------------------------------------------------ 读数差异

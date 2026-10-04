@@ -17,7 +17,10 @@
      - boundary_gap：边界空白，boundary_side=leading/trailing/empty
        （首读之前附右侧首条读数，末读之后附左侧末条读数，整窗无读数时
        两侧均无读数）；
-     - instrument_fault：被有效故障时段并集遮蔽（附覆盖该区间的故障标识）。
+     - instrument_fault：被有效故障时段并集遮蔽（每个半开原子区间只列
+       **实际覆盖该区间**的故障标识：相接两故障在接点处分段、各自单列；
+       重叠时段列全体在场标识；标识集合变化处即切段，故障边界据此切断
+       连续超限）。
    相邻且变化前后状态与证据完全相同的区间合并输出。
 """
 from __future__ import annotations
@@ -27,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional, Sequence
 
-from .evaluation import Interval, round_duration, union_intervals
+from .evaluation import Interval, round_duration
 from .models import UNKNOWN_INSTRUMENT_FAULT, VERDICT_LABELS_ZH
 from .timeutils import parse_stored, to_iso
 
@@ -173,49 +176,51 @@ def _mask_evidence_segments(
     win_start: datetime,
     win_end: datetime,
 ) -> list[EvidenceSeg]:
-    """用快照有效故障时段的并集遮蔽带证据区段。
+    """用快照有效故障时段遮蔽带证据区段。
 
-    与 app.evaluation 的审定遮蔽同一条切分规则：取原始区段边界与故障并集
-    边界的并集再切分；被任一故障半开区间覆盖的原子段记为 unknown
-    （unknown_reason=instrument_fault，附覆盖它的故障标识），未遮蔽部分
-    原样保留（含原证据）。故障边界据此切断连续超限。
+    与 app.evaluation 的审定遮蔽同一条切分规则：取原始区段边界与**每条
+    原始故障登记**边界（裁剪到窗口后）的并集再切分。被任一故障半开区间
+    覆盖的原子段记为 unknown（unknown_reason=instrument_fault），未遮蔽
+    部分原样保留（含原证据）。故障边界据此切断连续超限。
+
+    与审定遮蔽的区别只在证据归属：不使用“并集区间 -> 全体相交标识”的
+    粗粒度归属（相接故障会被并集合并，导致各自时段被误挂两个标识），而是
+    对每个原子段逐时刻判定**实际覆盖该段**的故障登记——
+      - 首尾相接的两故障 [a,b)、[b,c)：[a,b) 只挂前者、[b,c) 只挂后者
+        （半开口径，接点 b 属于后一段，前故障不覆盖 b）；
+      - 重叠时段：列出全体在场标识（排序、去重）；
+      - 标识集合变化处天然落有故障边界，必然切段。
     """
-    intervals = [
-        Interval(parse_stored(f["start_at"]), parse_stored(f["end_at"]))
-        for f in fault_rows
-    ]
-    fault_union = union_intervals(intervals, clip_start=win_start, clip_end=win_end)
-    if not fault_union:
+    # 逐条故障裁剪到窗口半开范围内（与 evaluation.union_intervals 同口径），
+    # 保留 fault_id；越界裁剪后为空的丢弃。
+    clipped: list[tuple[Interval, str]] = []
+    for f in fault_rows:
+        s, e = parse_stored(f["start_at"]), parse_stored(f["end_at"])
+        if s < win_start:
+            s = win_start
+        if e > win_end:
+            e = win_end
+        if s < e:
+            clipped.append((Interval(s, e), str(f.get("fault_id", ""))))
+    if not clipped:
         return segs
-
-    # 建立“并集区间 -> 覆盖它的原始故障标识集”：逐并集区间收集所有与之
-    # 相交的原始登记标识（重叠故障可能在同一点上同时遮蔽）。
-    union_fault_ids: list[tuple[str, ...]] = []
-    for fu in fault_union:
-        ids = sorted({
-            f.get("fault_id", "")
-            for f in fault_rows
-            if parse_stored(f["start_at"]) < fu.end and parse_stored(f["end_at"]) > fu.start
-        })
-        union_fault_ids.append(tuple(i for i in ids if i))
 
     cuts: set[datetime] = {win_start, win_end}
     for seg in segs:
         cuts.add(seg.start)
         cuts.add(seg.end)
-    for fu in fault_union:
-        cuts.add(fu.start)
-        cuts.add(fu.end)
+    for iv, _ in clipped:
+        cuts.add(iv.start)
+        cuts.add(iv.end)
     boundaries = sorted(cuts)
 
-    def _covering(t: datetime) -> int:
-        """返回覆盖时刻 t 的并集区间下标；未被遮蔽返回 -1。"""
-        for i, fu in enumerate(fault_union):
-            if fu.start <= t < fu.end:
-                return i
-            if t < fu.start:
-                break
-        return -1
+    def _covering_ids(t: datetime) -> tuple[str, ...]:
+        """返回实际覆盖时刻 t（半开 [start,end)）的全部故障标识。"""
+        ids = sorted({
+            fid for iv, fid in clipped
+            if fid and iv.start <= t < iv.end
+        })
+        return tuple(ids)
 
     out: list[EvidenceSeg] = []
     for seg in segs:
@@ -228,12 +233,12 @@ def _mask_evidence_segments(
             b2 = min(b, seg.end)
             if a2 >= b2:
                 continue
-            idx = _covering(a2)
-            if idx >= 0:
+            ids = _covering_ids(a2)
+            if ids:
                 out.append(EvidenceSeg(
                     a2, b2, "unknown",
                     unknown_reason=UNKNOWN_INSTRUMENT_FAULT,
-                    fault_ids=union_fault_ids[idx],
+                    fault_ids=ids,
                 ))
             else:
                 out.append(EvidenceSeg(a2, b2, seg.status,
